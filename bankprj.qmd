@@ -1,0 +1,312 @@
+---
+title: "Bank Marketing Classification Project"
+author: "Atharva Rane"
+format: pdf
+execute:
+  echo: true
+  message: false
+  warning: false
+---
+
+# Introduction
+
+In this project, we analyze the **Bank Marketing** dataset (`bank-additional.csv`) from the UCI Machine Learning Repository.  
+The goal is to predict whether a client subscribes to a **term deposit** (`y`: `yes`/`no`) based on client attributes, previous campaign outcomes, and macroeconomic indicators.
+
+We:
+
+- Explore and visualize the data.
+- Fit multiple supervised learning models:
+  - Logistic regression
+  - Penalized logistic regression (LASSO)
+  - Classification tree
+  - Random forest
+- Compare predictive performance using a train–test split.
+- Interpret predictor contributions via coefficients and variable importance.
+- Assess model stability using bootstrap resampling of the AUC.
+
+---
+
+# Data Loading and Preprocessing
+
+```{r}
+library(corrplot)
+library(tidyverse)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(glmnet)
+library(boot)
+
+# Read data
+bank <- read.csv("bank-additional.csv", sep = ";")
+
+# Response as factor with fixed levels
+bank$y <- factor(bank$y, levels = c("no", "yes"))
+
+# Drop duration and default (duration is post-call, default is ambiguous/sparse)
+bank <- bank %>%
+  select(-duration, -default)
+
+# Make categorical variables factors
+bank <- bank %>%
+  mutate(
+    job         = factor(job),
+    marital     = factor(marital),
+    education   = factor(education),
+    housing     = factor(housing),
+    loan        = factor(loan),
+    contact     = factor(contact),
+    month       = factor(month),
+    day_of_week = factor(day_of_week),
+    poutcome    = factor(poutcome)
+  )
+
+# Quick structure and outcome balance
+str(bank)
+table(bank$y)
+prop.table(table(bank$y))
+```
+## Exploratory Data Analysis
+
+### Class balance
+
+```{r}
+table(bank$y)
+prop.table(table(bank$y))
+
+ggplot(bank, aes(x = y)) +
+  geom_bar(fill = "#2C7FB8", color = "white") +
+  ggtitle("Class Balance (Full Dataset)") +
+  xlab("Subscription (y)") +
+  ylab("Count")
+```
+## Histogram of Age
+```{r}
+ggplot(bank, aes(x = age)) +
+  geom_histogram(bins = 30, fill = "#31A354", color = "white") +
+  ggtitle("Distribution of Age") +
+  xlab("Age") +
+  ylab("Count")
+```
+```{r}
+ggplot(bank, aes(x = age, fill = y)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30) +
+  ggtitle("Age Distribution by Subscription Outcome") +
+  xlab("Age") +
+  ylab("Count")
+```
+## Histogram of Contact Campaign
+```{r}
+ggplot(bank, aes(x = campaign)) +
+  geom_histogram(bins = 25, fill = "#FDB863", color = "white") +
+  xlim(0, 20) +
+  ggtitle("Distribution of Contact Frequency (campaign)") +
+  xlab("Number of contacts during this campaign") +
+  ylab("Count")
+```
+## Preious Outcome vs subscriptons
+```{r}
+ggplot(bank, aes(x = poutcome, fill = y)) +
+  geom_bar(position = "fill") +
+  ggtitle("Previous Outcome vs Subscription") +
+  ylab("Proportion") +
+  xlab("poutcome") +
+  scale_y_continuous(labels = scales::percent)
+```
+## Month vs subscription rate
+```{r}
+ggplot(bank, aes(x = month, fill = y)) +
+  geom_bar(position = "fill") +
+  ggtitle("Subscription Rate by Month") +
+  ylab("Proportion") +
+  xlab("Month") +
+  scale_y_continuous(labels = scales::percent)
+```
+## Euribor rate vs subscription (density plot)
+```{r}
+ggplot(bank, aes(x = euribor3m, color = y)) +
+  geom_density(linewidth = 1.1) +
+  ggtitle("Euribor 3-Month Rate by Subscription Outcome") +
+  xlab("euribor3m") +
+  ylab("Density")
+```
+### Job vs subscription (proportions)
+```{r}
+ggplot(bank, aes(x = job, fill = y)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  ggtitle("Job Category vs Subscription") +
+  ylab("Proportion") +
+  xlab("Job") +
+  scale_y_continuous(labels = scales::percent)
+```
+```{r}
+# Train–test split (70/30)
+set.seed(123)
+n <- nrow(bank)
+train_idx <- sample(1:n, 0.7 * n)
+train <- bank[train_idx, ]
+test  <- bank[-train_idx, ]
+
+prop.table(table(train$y))
+prop.table(table(test$y))
+
+```
+## Logistic Regression baseline model
+```{r}
+logit_fit <- glm(y ~ ., data = train, family = binomial)
+summary(logit_fit)
+
+logit_prob <- predict(logit_fit, test, type = "response")
+logit_pred <- ifelse(logit_prob > 0.5, "yes", "no") |> factor(levels=c("no","yes"))
+
+table(logit_pred, test$y)
+logit_auc <- auc(roc(test$y, logit_prob))
+logit_auc
+```
+## Penalized Logistic Regression (LASSO)
+```{r}
+x_train <- model.matrix(y ~ . - 1, train)
+y_train <- train$y
+
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train, family="binomial", alpha=1)
+
+best_lambda <- cv_lasso$lambda.min
+lasso_fit <- glmnet(x_train, y_train, family="binomial", alpha=1, lambda=best_lambda)
+
+x_test <- model.matrix(y ~ . - 1, test)
+lasso_prob <- predict(lasso_fit, newx = x_test, type="response")[,1]
+lasso_pred <- ifelse(lasso_prob > 0.5, "yes", "no") |> factor(levels=c("no","yes"))
+
+table(lasso_pred, test$y)
+lasso_auc <- auc(roc(test$y, lasso_prob))
+lasso_auc
+
+```
+## Ridge Regression
+```{r}
+# Prepare input matrices
+x <- model.matrix(y ~ ., data = train)[, -1]   # remove intercept column
+y <- train$y
+
+set.seed(123)
+
+# Fit ridge with cross-validation
+ridge_cv <- cv.glmnet(
+  x,
+  y,
+  alpha = 0,                # ridge penalty
+  family = "binomial",
+  type.measure = "auc"      # use AUC for evaluation
+)
+
+# Best lambda
+ridge_lambda <- ridge_cv$lambda.min
+ridge_lambda
+
+# Fit final ridge model at optimal lambda
+ridge_fit <- glmnet(
+  x,
+  y,
+  alpha = 0,
+  lambda = ridge_lambda,
+  family = "binomial"
+)
+
+# Predictions on test set
+x_test <- model.matrix(y ~ ., data = test)[, -1]
+ridge_prob <- predict(ridge_fit, newx = x_test, type = "response")
+
+# Compute AUC
+library(pROC)
+ridge_auc <- auc(test$y, ridge_prob)
+ridge_auc
+```
+## Classification Tree
+```{r}
+tree_fit <- rpart(y ~ ., data=train, method="class", 
+                  control=rpart.control(cp=0.001))
+
+# Choose best cp
+best_cp <- tree_fit$cptable[which.min(tree_fit$cptable[,"xerror"]), "CP"]
+tree_pruned <- prune(tree_fit, cp=best_cp)
+
+rpart.plot(tree_pruned, type=2, extra=104)
+
+tree_prob <- predict(tree_pruned, test, type="prob")[, "yes"]
+tree_pred <- ifelse(tree_prob > 0.5, "yes", "no") |> factor(levels=c("no","yes"))
+
+table(tree_pred, test$y)
+tree_auc <- auc(roc(test$y, tree_prob))
+tree_auc
+
+```
+## No. of Terminal Nodes:
+```{r}
+sum(tree_pruned$frame$var == "<leaf>")
+```
+## Random Forest
+
+```{r}
+set.seed(123)
+rf_fit <- randomForest(y ~ ., data=train,
+                       ntree=500, 
+                       mtry=floor(sqrt(ncol(train)-1)),
+                       importance=TRUE)
+
+rf_prob <- predict(rf_fit, test, type="prob")[, "yes"]
+rf_pred <- predict(rf_fit, test)
+
+table(rf_pred, test$y)
+rf_auc <- auc(roc(test$y, rf_prob))
+rf_auc
+
+varImpPlot(rf_fit)
+```
+## Model Performance Comparison
+```{r}
+perf <- data.frame(
+  Model = c("Logistic", "LASSO", "Tree", "Random Forest"),
+  AUC = c(logit_auc, lasso_auc, tree_auc, rf_auc)
+)
+perf
+
+```
+## Performance Interpretation
+```{r}
+exp(coef(logit_fit))
+coef(lasso_fit)
+importance(rf_fit)
+varImpPlot(rf_fit)
+
+
+```
+
+## Bootstrap for stability (AUC of logistic regression)
+```{r}
+logit_boot_auc <- function(data, indices) {
+  # Bootstrap sample
+  d <- data[indices, ]
+  
+  # Fit logistic regression on bootstrap sample
+  fit <- glm(y ~ ., data = d, family = binomial)
+  
+  # Predict on the same fixed test set to keep comparison fair
+  probs <- predict(fit, newdata = test, type = "response")
+  
+  # Return AUC as a single number
+  auc(roc(test$y, probs))
+}
+
+set.seed(123)
+boot_res <- boot(data = train, statistic = logit_boot_auc, R = 500)
+
+boot_res
+
+# Bootstrap CI for AUC
+boot.ci(boot_res, type = "perc")
+```
+
